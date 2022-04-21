@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.autograd as autograd
 
 
 class ShallowFCN(nn.Module):
-    def __init__(self, input_size=1, n_states=2):
+    def __init__(self, input_size=1, n_states=2, nonlin=F.relu):
         super().__init__()
         
         self.n_states = n_states
@@ -12,12 +13,14 @@ class ShallowFCN(nn.Module):
         self.A = nn.Linear(n_states,n_states)
         self.B = nn.Linear(input_size,n_states)
 
+        self.nonlin = nonlin
+
         # decreasing initial weights to increase stability
         self.A.weight = nn.Parameter(0.1 * self.A.weight)
         self.B.weight = nn.Parameter(0.1 * self.B.weight)
 
     def forward(self, z, x):
-        return torch.sigmoid(self.A(z) + self.B(x))
+        return self.nonlin(self.A(z) + self.B(x))
 
 class DEQFixedPoint(nn.Module):
     def __init__(self, f: nn.Module, solver, **kwargs):
