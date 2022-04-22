@@ -34,7 +34,7 @@ class DEQFixedPoint(nn.Module):
         with torch.no_grad():
             z, self.forward_res = self.solver(
                 lambda z : self.f(z, x),
-                torch.zeros(x.shape[0], self.f.n_states),
+                torch.zeros(x.shape[0], self.f.n_states).to(x.device),
                 **self.kwargs
             )
 
