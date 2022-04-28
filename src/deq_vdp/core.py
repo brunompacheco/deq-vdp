@@ -20,9 +20,10 @@ class ShallowFCN(nn.Module):
         self.B.weight = nn.Parameter(0.1 * self.B.weight)
 
     def forward(self, z, x):
-        return self.nonlin(self.A(z) + self.B(x))
+        y = self.A(z) + self.B(x)
+        return self.nonlin(y)
 
-class DEQFixedPoint(nn.Module):
+class DEQModel(nn.Module):
     def __init__(self, f: nn.Module, solver, **kwargs):
         super().__init__()
         self.f = f
@@ -30,27 +31,41 @@ class DEQFixedPoint(nn.Module):
         self.kwargs = kwargs
 
     def forward(self, x: torch.Tensor):
+        z0 = torch.zeros(x.shape[0], self.f.n_states).to(x.device)
+
         # compute forward pass
         with torch.no_grad():
-            z, self.forward_res = self.solver(
+            z_star, self.forward_res = self.solver(
                 lambda z : self.f(z, x),
-                torch.zeros(x.shape[0], self.f.n_states).to(x.device),
+                z0,
                 **self.kwargs
             )
 
-        # re-engage autograd, like a forward pass with a really good initial guess
-        z = self.f(z,x)
+        # (Prepare for) Backward pass, see step 3 above
+        if self.training:
+            z_star.requires_grad_()
+            # re-engage autograd (I believe this is necessary to compute df/dx, which is necessary for backprop)
+            new_z_star = self.f(z_star, x)
+            
+            # Jacobian-related computations, see additional step above. For instance:
+            # jac_loss = jac_loss_estimate(new_z_star, z_star, vecs=1)
 
-        # set up Jacobian vector product (without additional forward calls)
-        z0 = z.clone().detach().requires_grad_()
-        f0 = self.f(z0, x)
-        def backward_hook(y):
-            g, self.backward_res = self.solver(
-                lambda g : autograd.grad(f0, z0, g, retain_graph=True)[0] + y,
-                y,
-                **self.kwargs
-            )
-            return g
+            def backward_hook(grad):
+                if self.hook is not None:
+                    self.hook.remove()
+                    torch.cuda.synchronize()   # To avoid infinite recursion
 
-        z.register_hook(backward_hook)
-        return z
+                # Compute the fixed point of yJ + grad, where J=J_f is the Jacobian of f at z_star
+                new_grad, self.backward_res = self.solver(
+                    lambda y: autograd.grad(new_z_star, z_star, y, retain_graph=True)[0] + grad,
+                    torch.zeros_like(grad),
+                    **self.kwargs
+                )
+
+                return new_grad
+
+            self.hook = new_z_star.register_hook(backward_hook)
+        else:
+            new_z_star = z_star
+
+        return new_z_star
