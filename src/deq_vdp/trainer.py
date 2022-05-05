@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import logging
 from pathlib import Path
 import random
@@ -29,7 +30,7 @@ def timeit(fun):
 
     return fun_
 
-class VdPTrainer():
+class Trainer(ABC):
     """Generic trainer for PyTorch NNs.
 
     Attributes:
@@ -48,24 +49,13 @@ class VdPTrainer():
         random_seed: if not None (default = 42), fixes randomness for Python,
         NumPy as PyTorch (makes trainig reproducible).
     """
-    def __init__(self, net: nn.Module, Nt=1e3, Nf=1e5, u_bounds=(-1, 1),
-                 y_bounds=(-3, 3), epochs=5, lr= 0.1, lamb=.1, h=None,
+    def __init__(self, net: nn.Module, epochs=5, lr= 0.1,
                  optimizer: str = 'Adam', optimizer_params: dict = None,
                  loss_func: str = 'MSELoss', lr_scheduler: str = None,
                  lr_scheduler_params: dict = None, batch_size=16,
-                 device=None, wandb_project="van-der-pol", wandb_group=None,
+                 device=None, wandb_project=None, wandb_group=None,
                  logger=None, checkpoint_every=50, random_seed=42) -> None:
         self._is_initalized = False
-
-        self.Nt = Nt
-        self.Nf = Nf
-        self.u_bounds = u_bounds
-        self.y_bounds = y_bounds
-
-        # self.h = lambda z: z * self.y_bounds[1] + self.y_bounds[0]
-        self.h = lambda z: z * (self.y_bounds[1] - self.y_bounds[0]) / 2
-
-        self.lamb = lamb
 
         if device is None:
             self.device = torch.device(
@@ -73,21 +63,6 @@ class VdPTrainer():
             )
         else:
             self.device = device
-
-        # TODO: expose `val_params`
-        y0 = torch.zeros(1,2).to(self.device)
-        y0[0,1] = .1
-        u = torch.zeros(1,1).to(self.device)
-        dt = torch.ones(1,1).to(self.device) * 0.1
-        K = 200
-        Y_ref = odeint(lambda t, y: f(y,u), y0, torch.Tensor([i * dt for i in range(K+1)]), method='rk4')
-        self.val_params = {
-            'y0': y0,
-            'u': u,
-            'dt': dt,
-            'K': K,
-            'Y_ref': Y_ref,
-        }
 
         self._e = 0  # inital epoch
 
@@ -121,23 +96,6 @@ class VdPTrainer():
         self._log_to_wandb = False if wandb_project is None else True
         self.wandb_project = wandb_project
         self.wandb_group = wandb_group
-
-    def get_dY_pred(self, Y_pred, X):
-        delY0_pred = torch.autograd.grad(
-            Y_pred[:,0],
-            X,
-            grad_outputs=torch.ones_like(Y_pred[:,0]),
-            create_graph=True
-        )[0][:,0]  # time derivative (first input dimension)
-
-        delY1_pred = torch.autograd.grad(
-            Y_pred[:,1],
-            X,
-            grad_outputs=torch.ones_like(Y_pred[:,1]),
-            create_graph=True
-        )[0][:,0]  # time derivative (first input dimension)
-
-        return torch.stack((delY0_pred, delY1_pred), dim=-1)
 
     @classmethod
     def load_trainer(cls, net: nn.Module, run_id: str, wandb_project="van-der-pol",
@@ -208,8 +166,7 @@ class VdPTrainer():
             self._scheduler = Scheduler(self._optim, **self.lr_scheduler_params)
             self._scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        self._loss_func_y = eval(f"nn.{self.loss_func}()")
-        self._loss_func_F = eval(f"nn.{self.loss_func}()")
+        self._loss_func = eval(f"nn.{self.loss_func}()")
 
         self.prepare_data()
 
@@ -229,9 +186,6 @@ class VdPTrainer():
         if self.lr_scheduler is not None:
             Scheduler = eval(f"torch.optim.lr_scheduler.{self.lr_scheduler}")
             self._scheduler = Scheduler(self._optim, **self.lr_scheduler_params)
-
-        self._loss_func_y = eval(f"nn.{self.loss_func}()")
-        self._loss_func_F = eval(f"nn.{self.loss_func}()")
 
         if self._log_to_wandb:
             self.l.info('Initializing wandb.')
@@ -267,57 +221,57 @@ class VdPTrainer():
 
         self.l.info(f"Wandb set up. Run ID: {self._id}")
 
+    @abstractmethod
     def prepare_data(self):
-        (X_t, Y_t), (X_f, dY_f) = get_data(self.Nt, self.Nf, self.u_bounds, self.y_bounds)
+        """Must populate `self.data` and `self.val_data`.
+        """
 
-        X_t = X_t.to(self.device)
-        Y_t = Y_t.to(self.device)
-        X_f = X_f.to(self.device)
-        dY_f = dY_f.to(self.device)
+    def _run_epoch(self):
+        # train
+        train_time, train_loss = timeit(self.train_pass)()
 
-        self.data = (X_t, Y_t), (X_f, dY_f)
+        self.l.info(f"Training pass took {train_time:.3f} seconds")
+        self.l.info(f"Training loss = {train_loss}")
+
+        # validation
+        val_time, val_loss = timeit(self.validation_pass)()
+
+        self.l.info(f"Validation pass took {val_time:.3f} seconds")
+        self.l.info(f"Validation loss = {val_loss}")
+
+        data_to_log = {
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+        }
+
+        val_score = val_loss  # defines best model
+
+        return data_to_log, val_score
 
     def run(self):
         if not self._is_initalized:
             self.setup_training()
 
-        scaler = GradScaler()
+        self._scaler = GradScaler()
         while self._e < self.epochs:
             self.l.info(f"Epoch {self._e} started ({self._e+1}/{self.epochs})")
             epoch_start_time = time()
 
-            # train
-            train_time, (train_loss_y, train_loss_f) = timeit(self.train_pass)(scaler)
-            train_loss = train_loss_y + self.lamb * train_loss_f
-
-            self.l.info(f"Training pass took {train_time:.3f} seconds")
-            self.l.info(f"Training loss = {train_loss}")
-
-            # validation
-            val_time, iae = timeit(self.validation_pass)()
-
-            self.l.info(f"Validation pass took {val_time:.3f} seconds")
-            self.l.info(f"IAE = {iae}")
+            data_to_log, val_score = self._run_epoch()
 
             if self._log_to_wandb:
-                wandb.log({
-                    "train_loss": train_loss,
-                    "train_loss_y": train_loss_y,
-                    "train_loss_f": train_loss_f,
-                    "iae": iae,
-                }, step=self._e, commit=True)
+                wandb.log(data_to_log, step=self._e, commit=True)
 
                 if self._e % self.checkpoint_every == self.checkpoint_every - 1:
                     self.l.info(f"Saving checkpoint")
                     self.save_checkpoint()
 
-            # TODO: save on moving average improvement! IAE is very unstable
-            if iae < self.best_val:
+            if val_score < self.best_val:
                 if self._log_to_wandb:
                     self.l.info(f"Saving best model")
                     self.save_model(name='model_best')
 
-                self.best_val = iae
+                self.best_val = val_score
 
             epoch_end_time = time()
             self.l.info(
@@ -335,55 +289,56 @@ class VdPTrainer():
 
         self.l.info('Training finished!')
 
-    def train_pass(self, scaler):
+    def train_pass(self):
+        train_loss = 0
         self.net.train()
-
-        (X_t, Y_t), (X_f, dY_f) = self.data
-        X_f.requires_grad_()
         with torch.set_grad_enabled(True):
-            self._optim.zero_grad()
+            for X, y in self.data:
+                X = X.to(self.device)
+                y = y.to(self.device)
 
-            with autocast():
-                Y_t_pred = self.h(self.net(X_t))
+                self._optim.zero_grad()
 
-                loss_y = self._loss_func_y(Y_t_pred, Y_t)
+                with autocast():
+                    y_hat = self.net(X)
 
-                Y_f_pred = self.h(self.net(X_f))
+                    loss = self._loss_func(y_hat, y)
 
-                dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+                self._scaler.scale(loss).backward()
 
-                loss_f = self._loss_func_F(dY_pred, dY_f)
+                train_loss += loss.item() * len(y)
 
-                loss = loss_y + self.lamb * loss_f
-
-            scaler.scale(loss).backward()
-
-            scaler.step(self._optim)
-            scaler.update()
+                self._scaler.step(self._optim)
+                self._scaler.update()
 
             if self.lr_scheduler is not None:
                 self._scheduler.step()
 
-        return loss_y.item(), loss_f.item()
+        # scale to data size
+        train_loss = train_loss / len(self.data)
+
+        return train_loss
 
     def validation_pass(self):
+        val_loss = 0
+
         self.net.eval()
-
-        dt, y0, u, Y_ref = self.val_params['dt'],self.val_params['y0'],self.val_params['u'],self.val_params['Y_ref']
-        Y = [self.val_params['y0'].cpu().detach().numpy().squeeze(),]
-
-        x = torch.cat((dt,y0,u), dim=-1).to(self.device)
         with torch.set_grad_enabled(False):
-            for _ in range(self.val_params['K']):
-                y_next = self.h(self.net(x))
+            for X, y in self.val_data:
+                X = X.to(self.device)
+                y = y.to(self.device)
 
-                Y.append(y_next.cpu().detach().numpy().squeeze())
+                with autocast():
+                    y_hat = self.net(X)
+                    loss_value = self._loss_func(y_hat, y).item()
 
-                x = torch.cat((dt,y_next,u), dim=-1)
+                val_loss += loss_value * len(y)  # scales to data size
 
-        iae = np.abs(Y_ref.cpu().detach().numpy() - Y).mean()
+        # scale to data size
+        len_data = len(self.val_data)
+        val_loss = val_loss / len_data
 
-        return iae
+        return val_loss
 
     def save_checkpoint(self):
         checkpoint = {
@@ -408,6 +363,217 @@ class VdPTrainer():
 
         return fpath
 
+class VdPTrainer(Trainer):
+    """Generic trainer for PyTorch NNs.
+
+    Attributes:
+        net: the neural network to be trained.
+        epochs: number of epochs to train the network.
+        lr: learning rate.
+        optimizer: optimizer (name of a optimizer inside `torch.optim`).
+        loss_func: a valid PyTorch loss function.
+        lr_scheduler: if a scheduler is to be used, provide the name of a valid
+        `torch.optim.lr_scheduler`.
+        lr_scheduler_params: parameters of selected `lr_scheduler`.
+        batch_size: batch_size for training.
+        device: see `torch.device`.
+        wandb_project: W&B project where to log and store model.
+        logger: see `logging`.
+        random_seed: if not None (default = 42), fixes randomness for Python,
+        NumPy as PyTorch (makes trainig reproducible).
+    """
+    def __init__(self, net: nn.Module, Nt=1e3, Nf=1e5, u_bounds=(-1, 1),
+                 y_bounds=(-3, 3), epochs=5, lr= 0.1, lamb=.1, h=None,
+                 optimizer: str = 'Adam', optimizer_params: dict = None,
+                 loss_func: str = 'MSELoss', lr_scheduler: str = None,
+                 lr_scheduler_params: dict = None, batch_size=16,
+                 device=None, wandb_project="van-der-pol", wandb_group=None,
+                 logger=None, checkpoint_every=50, random_seed=42) -> None:
+        super().__init__(net, epochs, lr, optimizer, optimizer_params, loss_func,
+                         lr_scheduler, lr_scheduler_params, batch_size, device,
+                         wandb_project, wandb_group, logger, checkpoint_every,
+                         random_seed)
+
+        self.Nt = Nt
+        self.Nf = Nf
+        self.u_bounds = u_bounds
+        self.y_bounds = y_bounds
+
+        if h is None:
+            self.h = lambda z: z * (self.y_bounds[1] - self.y_bounds[0]) / 2
+
+        self.lamb = lamb
+
+        # TODO: expose `val_params`
+        y0 = torch.zeros(1,2).to(self.device)
+        y0[0,1] = .1
+        u = torch.zeros(1,1).to(self.device)
+        dt = torch.ones(1,1).to(self.device) * 0.1
+        K = 200
+        Y_ref = odeint(lambda t, y: f(y,u), y0, torch.Tensor([i * dt for i in range(K+1)]), method='rk4')
+        self.val_params = {
+            'y0': y0,
+            'u': u,
+            'dt': dt,
+            'K': K,
+            'Y_ref': Y_ref,
+        }
+
+        self.data = None
+        self.val_data = None
+
+    def get_dY_pred(self, Y_pred, X):
+        delY0_pred = torch.autograd.grad(
+            Y_pred[:,0],
+            X,
+            grad_outputs=torch.ones_like(Y_pred[:,0]),
+            create_graph=True
+        )[0][:,0]  # time derivative (first input dimension)
+
+        delY1_pred = torch.autograd.grad(
+            Y_pred[:,1],
+            X,
+            grad_outputs=torch.ones_like(Y_pred[:,1]),
+            create_graph=True
+        )[0][:,0]  # time derivative (first input dimension)
+
+        return torch.stack((delY0_pred, delY1_pred), dim=-1)
+
+    @classmethod
+    def load_trainer(cls, net: nn.Module, run_id: str, wandb_project="van-der-pol", logger=None):
+        self = super().load_trainer(net, run_id, wandb_project, logger)
+
+        self._loss_func_y = eval(f"nn.{self.loss_func}()")
+        self._loss_func_F = eval(f"nn.{self.loss_func}()")
+
+        return self
+
+    def setup_training(self):
+        r =  super().setup_training()
+
+        self._loss_func_y = eval(f"nn.{self.loss_func}()")
+        self._loss_func_F = eval(f"nn.{self.loss_func}()")
+
+        return r
+
+    def prepare_data(self):
+        (X_t, Y_t), (X_f, U_f) = get_data(self.Nt, self.Nf, self.u_bounds, self.y_bounds)
+
+        X_t = X_t.to(self.device)
+        Y_t = Y_t.to(self.device)
+        X_f = X_f.to(self.device)
+        U_f = U_f.to(self.device)
+
+        self.data = (X_t, Y_t), (X_f, U_f)
+
+        if self.val_data is None:
+            (X_t, Y_t), (X_f, U_f) = get_data(self.Nt // 5, self.Nf // 5, self.u_bounds, self.y_bounds)
+
+            X_t = X_t.to(self.device)
+            Y_t = Y_t.to(self.device)
+            X_f = X_f.to(self.device)
+            U_f = U_f.to(self.device)
+
+            self.val_data = (X_t, Y_t), (X_f, U_f)
+
+    def _run_epoch(self):
+        # train
+        train_time, (train_loss_y, train_loss_f) = timeit(self.train_pass)()
+        train_loss = train_loss_y + self.lamb * train_loss_f
+
+        self.l.info(f"Training pass took {train_time:.3f} seconds")
+        self.l.info(f"Training loss = {train_loss}")
+
+        # validation
+        val_time, (iae, val_loss_y, val_loss_f) = timeit(self.validation_pass)()
+        val_loss = val_loss_y + self.lamb * val_loss_f
+
+        self.l.info(f"Validation pass took {val_time:.3f} seconds")
+        self.l.info(f"IAE = {iae}")
+
+        data_to_log = {
+            "train_loss": train_loss,
+            "train_loss_y": train_loss_y,
+            "train_loss_f": train_loss_f,
+            "val_loss": val_loss,
+            "val_loss_y": val_loss_y,
+            "val_loss_f": val_loss_f,
+            "iae": iae,
+        }
+
+        val_score = iae  # defines best model
+
+        return data_to_log, val_score
+
+    def train_pass(self):
+        self.net.train()
+
+        (X_t, Y_t), (X_f, U_f) = self.data
+        X_f.requires_grad_()
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+
+            with autocast():
+                Y_t_pred = self.h(self.net(X_t))
+
+                loss_y = self._loss_func_y(Y_t_pred, Y_t)
+
+                Y_f_pred = self.h(self.net(X_f))
+
+                dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+
+                dY_f = f(Y_f_pred, U_f)
+
+                loss_f = self._loss_func_F(dY_pred, dY_f)
+
+                loss = loss_y + self.lamb * loss_f
+
+            self._scaler.scale(loss).backward()
+
+            self._scaler.step(self._optim)
+            self._scaler.update()
+
+            if self.lr_scheduler is not None:
+                self._scheduler.step()
+
+        return loss_y.item(), loss_f.item()
+
+    def validation_pass(self):
+        self.net.eval()
+
+        dt, y0, u, Y_ref = self.val_params['dt'],self.val_params['y0'],self.val_params['u'],self.val_params['Y_ref']
+        Y = [self.val_params['y0'].cpu().detach().numpy().squeeze(),]
+
+        x = torch.cat((dt,y0,u), dim=-1).to(self.device)
+        with torch.set_grad_enabled(False):
+            for _ in range(self.val_params['K']):
+                y_next = self.h(self.net(x))
+
+                Y.append(y_next.cpu().detach().numpy().squeeze())
+
+                x = torch.cat((dt,y_next,u), dim=-1)
+
+        iae = np.abs(Y_ref.cpu().detach().numpy() - Y).mean()
+
+        (X_t, Y_t), (X_f, U_f) = self.val_data
+        X_f.requires_grad_()
+        with torch.set_grad_enabled(False):
+            Y_t_pred = self.h(self.net(X_t))
+
+            loss_y = ((Y_t_pred - Y_t)**2).mean()
+
+        with torch.set_grad_enabled(True):
+            Y_f_pred = self.h(self.net(X_f))
+
+            dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+
+        with torch.set_grad_enabled(False):
+            dY_f = f(Y_f_pred, U_f)
+
+            loss_f = ((dY_pred - dY_f)**2).mean()
+
+        return iae, loss_y, loss_f
+
 class VdPTrainerLBFGS(VdPTrainer):
     def __init__(self, net: nn.Module, Nt=1e3, Nf=1e5, u_bounds=(-1, 1),
                  y_bounds=(-3, 3), epochs=5, lr=1., lamb=.1, h=None,
@@ -421,10 +587,10 @@ class VdPTrainerLBFGS(VdPTrainer):
                          batch_size, device, wandb_project, wandb_group, logger,
                          checkpoint_every, random_seed)
 
-    def train_pass(self, scaler):
+    def train_pass(self):
         self.net.train()
 
-        (X_t, Y_t), (X_f, dY_f) = self.data
+        (X_t, Y_t), (X_f, U_f) = self.data
         X_f.requires_grad_()
 
         y_losses = list()
@@ -441,6 +607,8 @@ class VdPTrainerLBFGS(VdPTrainer):
                 Y_f_pred = self.h(self.net(X_f))
 
                 dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+
+                dY_f = f(Y_f_pred, U_f)
 
                 loss_f = self._loss_func_F(dY_pred, dY_f)
 
