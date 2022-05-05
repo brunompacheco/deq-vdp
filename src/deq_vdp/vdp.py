@@ -24,6 +24,6 @@ def get_data(Nt=1e3, Nf=1e5, u_bounds=(-1., 1.), y_bounds=(-3., 3.)):
     U_f = torch.rand(Nf,1) * u_range + u_bounds[0]  # Input data points for training
     X_f = torch.cat((torch.zeros(Nf,1),Y_f,U_f), dim=1)
 
-    dY_f = f(Y_f,U_f)
+    # dY_f = f(Y_f,U_f)
 
-    return (X_t, Y_t), (X_f, dY_f)
+    return (X_t, Y_t), (X_f, U_f)
