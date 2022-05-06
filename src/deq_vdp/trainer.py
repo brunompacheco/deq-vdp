@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
+
 import logging
 from pathlib import Path
 import random
-from tabnanny import check
 
 from time import time
 import numpy as np
@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader
 
 from torchdiffeq import odeint
 
@@ -42,7 +41,6 @@ class Trainer(ABC):
         lr_scheduler: if a scheduler is to be used, provide the name of a valid
         `torch.optim.lr_scheduler`.
         lr_scheduler_params: parameters of selected `lr_scheduler`.
-        batch_size: batch_size for training.
         device: see `torch.device`.
         wandb_project: W&B project where to log and store model.
         logger: see `logging`.
@@ -52,7 +50,7 @@ class Trainer(ABC):
     def __init__(self, net: nn.Module, epochs=5, lr= 0.1,
                  optimizer: str = 'Adam', optimizer_params: dict = None,
                  loss_func: str = 'MSELoss', lr_scheduler: str = None,
-                 lr_scheduler_params: dict = None, batch_size=16,
+                 lr_scheduler_params: dict = None,
                  device=None, wandb_project=None, wandb_group=None,
                  logger=None, checkpoint_every=50, random_seed=42) -> None:
         self._is_initalized = False
@@ -68,7 +66,6 @@ class Trainer(ABC):
 
         self.epochs = epochs
         self.lr = lr
-        self.batch_size = batch_size
 
         self.net = net.to(self.device)
         self.optimizer = optimizer
@@ -137,7 +134,6 @@ class Trainer(ABC):
             loss_func=wandb.config['loss_func'],
             lr_scheduler=wandb.config['lr_scheduler'],
             lr_scheduler_params=wandb.config['lr_scheduler_params'],
-            batch_size=wandb.config['batch_size'],
             device=wandb.config['device'],
             logger=logger,
             wandb_project=wandb_project,
@@ -191,6 +187,8 @@ class Trainer(ABC):
             self.l.info('Initializing wandb.')
             self.initialize_wandb()
 
+        self._loss_func = eval(f"nn.{self.loss_func}()")
+
         self.l.info('Preparing data')
         self.prepare_data()
 
@@ -204,7 +202,6 @@ class Trainer(ABC):
             config={
                 "learning_rate": self.lr,
                 "epochs": self.epochs,
-                "batch_size": self.batch_size,
                 "model": type(self.net).__name__,
                 "optimizer": self.optimizer,
                 "lr_scheduler": self.lr_scheduler,
@@ -364,7 +361,7 @@ class Trainer(ABC):
         return fpath
 
 class VdPTrainer(Trainer):
-    """Generic trainer for PyTorch NNs.
+    """TODO.
 
     Attributes:
         net: the neural network to be trained.
@@ -375,7 +372,6 @@ class VdPTrainer(Trainer):
         lr_scheduler: if a scheduler is to be used, provide the name of a valid
         `torch.optim.lr_scheduler`.
         lr_scheduler_params: parameters of selected `lr_scheduler`.
-        batch_size: batch_size for training.
         device: see `torch.device`.
         wandb_project: W&B project where to log and store model.
         logger: see `logging`.
@@ -386,11 +382,11 @@ class VdPTrainer(Trainer):
                  y_bounds=(-3, 3), epochs=5, lr= 0.1, lamb=.1, h=None,
                  optimizer: str = 'Adam', optimizer_params: dict = None,
                  loss_func: str = 'MSELoss', lr_scheduler: str = None,
-                 lr_scheduler_params: dict = None, batch_size=16,
+                 lr_scheduler_params: dict = None,
                  device=None, wandb_project="van-der-pol", wandb_group=None,
                  logger=None, checkpoint_every=50, random_seed=42) -> None:
         super().__init__(net, epochs, lr, optimizer, optimizer_params, loss_func,
-                         lr_scheduler, lr_scheduler_params, batch_size, device,
+                         lr_scheduler, lr_scheduler_params, device,
                          wandb_project, wandb_group, logger, checkpoint_every,
                          random_seed)
 
@@ -410,13 +406,11 @@ class VdPTrainer(Trainer):
         u = torch.zeros(1,1).to(self.device)
         dt = torch.ones(1,1).to(self.device) * 0.1
         K = 200
-        Y_ref = odeint(lambda t, y: f(y,u), y0, torch.Tensor([i * dt for i in range(K+1)]), method='rk4')
         self.val_params = {
             'y0': y0,
             'u': u,
             'dt': dt,
             'K': K,
-            'Y_ref': Y_ref,
         }
 
         self.data = None
@@ -474,7 +468,10 @@ class VdPTrainer(Trainer):
             X_f = X_f.to(self.device)
             U_f = U_f.to(self.device)
 
-            self.val_data = (X_t, Y_t), (X_f, U_f)
+            dt, y0, u, K = self.val_params['dt'],self.val_params['y0'],self.val_params['u'],self.val_params['K']
+            Y_ref = odeint(lambda t, y: f(y,u), y0, torch.Tensor([i * dt for i in range(K+1)]), method='rk4')
+
+            self.val_data = (X_t, Y_t), (X_f, U_f), Y_ref
 
     def _run_epoch(self):
         # train
@@ -541,7 +538,9 @@ class VdPTrainer(Trainer):
     def validation_pass(self):
         self.net.eval()
 
-        dt, y0, u, Y_ref = self.val_params['dt'],self.val_params['y0'],self.val_params['u'],self.val_params['Y_ref']
+        (X_t, Y_t), (X_f, U_f), Y_ref = self.val_data
+
+        dt, y0, u = self.val_params['dt'],self.val_params['y0'],self.val_params['u']
         Y = [self.val_params['y0'].cpu().detach().numpy().squeeze(),]
 
         x = torch.cat((dt,y0,u), dim=-1).to(self.device)
@@ -555,7 +554,6 @@ class VdPTrainer(Trainer):
 
         iae = np.abs(Y_ref.cpu().detach().numpy() - Y).mean()
 
-        (X_t, Y_t), (X_f, U_f) = self.val_data
         X_f.requires_grad_()
         with torch.set_grad_enabled(False):
             Y_t_pred = self.h(self.net(X_t))
@@ -579,12 +577,12 @@ class VdPTrainerLBFGS(VdPTrainer):
                  y_bounds=(-3, 3), epochs=5, lr=1., lamb=.1, h=None,
                  lbfgs_params: dict = None, loss_func: str = 'MSELoss',
                  lr_scheduler: str = None, lr_scheduler_params: dict = None,
-                 batch_size=16, device=None, wandb_project="van-der-pol",
+                 device=None, wandb_project="van-der-pol",
                  wandb_group=None, logger=None, checkpoint_every=50,
                  random_seed=42) -> None:
         super().__init__(net, Nt, Nf, u_bounds, y_bounds, epochs, lr, lamb, h, 'LBFGS',
                          lbfgs_params, loss_func, lr_scheduler, lr_scheduler_params,
-                         batch_size, device, wandb_project, wandb_group, logger,
+                         device, wandb_project, wandb_group, logger,
                          checkpoint_every, random_seed)
 
     def train_pass(self):
@@ -631,5 +629,202 @@ class VdPTrainerLBFGS(VdPTrainer):
 
             if self.lr_scheduler is not None:
                 self._scheduler.step()
+
+        return y_losses[-1], f_losses[-1]
+
+class VdPTrainerPINN(Trainer):
+    def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=1e5, y_bounds=(-3, 3),
+                 T_max=20., val_dt=0.1, epochs=5, lr=0.1, optimizer: str = 'Adam',
+                 lamb=.1, optimizer_params: dict = None, loss_func: str = 'MSELoss',
+                 lr_scheduler: str = None, lr_scheduler_params: dict = None,
+                 device=None, wandb_project="van-der-pol", wandb_group="PINN-Adam",
+                 logger=None, checkpoint_every=50, random_seed=42):
+        super().__init__(net, epochs, lr, optimizer, optimizer_params, loss_func,
+                         lr_scheduler, lr_scheduler_params, device,
+                         wandb_project, wandb_group, logger, checkpoint_every,
+                         random_seed)
+
+        self.Nf = int(Nf)    # number of collocation points
+        self.y_0 = y_0  # initial conditions
+        self.y_bounds = y_bounds
+        self.T_max = T_max
+        self.val_dt = val_dt
+
+        self.lamb = lamb
+
+        self.data = None
+        self.val_data = None
+
+    def prepare_data(self):
+        X = torch.rand(self.Nf,1) * self.T_max
+
+        self.data = X.to(self.device)
+
+        if self.val_data is None:
+            K = int(self.T_max / self.val_dt)
+
+            X_val = torch.Tensor([i * self.val_dt for i in range(K+1)])
+
+            u = torch.zeros(1, 1)  # uncontrolled
+            Y_val = odeint(lambda t, y: f(y,u), torch.Tensor(self.y_0).unsqueeze(0), X_val, method='rk4')
+
+            self.val_data = X_val.to(self.device).unsqueeze(-1), Y_val.to(self.device).squeeze()
+
+    def get_dY_pred(self, Y_pred, X):
+        delY0_pred = torch.autograd.grad(
+            Y_pred[:,0],
+            X,
+            grad_outputs=torch.ones_like(Y_pred[:,0]),
+            create_graph=True
+        )[0][:,0]  # time derivative (first input dimension)
+
+        delY1_pred = torch.autograd.grad(
+            Y_pred[:,1],
+            X,
+            grad_outputs=torch.ones_like(Y_pred[:,1]),
+            create_graph=True
+        )[0][:,0]  # time derivative (first input dimension)
+
+        return torch.stack((delY0_pred, delY1_pred), dim=-1)
+
+    def _run_epoch(self):
+        # train
+        train_time, (train_loss_y, train_loss_f) = timeit(self.train_pass)()
+        train_loss = train_loss_y + self.lamb * train_loss_f
+
+        self.l.info(f"Training pass took {train_time:.3f} seconds")
+        self.l.info(f"Training loss = {train_loss}")
+
+        # validation
+        val_time, iae = timeit(self.validation_pass)()
+
+        self.l.info(f"Validation pass took {val_time:.3f} seconds")
+        self.l.info(f"IAE = {iae}")
+
+        data_to_log = {
+            "train_loss": train_loss,
+            "train_loss_y": train_loss_y,
+            "train_loss_f": train_loss_f,
+            "iae": iae,
+        }
+
+        val_score = iae  # defines best model
+
+        return data_to_log, val_score
+
+    def train_pass(self):
+        self.net.train()
+
+        # boundary
+        X_t = torch.zeros(1,1).to(self.device)
+        Y_t = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
+
+        # collocation
+        X_f = self.data
+        X_f.requires_grad_()
+
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+
+            with autocast():
+                Y_t_pred = self.net(X_t)
+
+                loss_y = self._loss_func(Y_t_pred, Y_t)
+
+                Y_f_pred = self.net(X_f)
+
+                dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+
+                u = torch.zeros(Y_f_pred.shape[0], 1).to(self.device)  # uncontrolled
+                dY_f = f(Y_f_pred, u)
+
+                loss_f = self._loss_func(dY_pred, dY_f)
+
+                loss = loss_y + self.lamb * loss_f
+
+            self._scaler.scale(loss).backward()
+
+            self._scaler.step(self._optim)
+            self._scaler.update()
+
+            if self.lr_scheduler is not None:
+                self._scheduler.step()
+
+        return loss_y.item(), loss_f.item()
+
+    def validation_pass(self):
+        self.net.eval()
+
+        X, Y = self.val_data
+
+        with torch.set_grad_enabled(False):
+            Y_pred = self.net(X)
+
+        iae = (Y - Y_pred).abs().mean().item()
+
+        return iae
+
+class VdPTrainerPINNLBFGS(VdPTrainerPINN):
+    def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=100000, y_bounds=(-3, 3),
+                 T_max=20, val_dt=0.1, epochs=5, lr=0.1, lamb=0.1,
+                 optimizer_params: dict = None, loss_func: str = 'MSELoss',
+                 lr_scheduler: str = None, lr_scheduler_params: dict = None,
+                 device=None, wandb_project="van-der-pol", wandb_group="PINN-LBFGS",
+                 logger=None, checkpoint_every=50, random_seed=42):
+        super().__init__(net, y_0, Nf, y_bounds, T_max, val_dt, epochs, lr, 'LBFGS',
+                         lamb, optimizer_params, loss_func, lr_scheduler,
+                         lr_scheduler_params, device, wandb_project, wandb_group,
+                         logger, checkpoint_every, random_seed)
+
+    def train_pass(self):
+        self.net.train()
+
+        # boundary
+        X_t = torch.zeros(1,1).to(self.device)
+        Y_t = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
+
+        # collocation
+        X_f = self.data
+        X_f.requires_grad_()
+
+        y_losses = list()
+        f_losses = list()
+        losses = list()
+        with torch.set_grad_enabled(True):
+            def closure():
+                self._optim.zero_grad()
+
+                Y_t_pred = self.net(X_t)
+
+                loss_y = self._loss_func(Y_t_pred, Y_t)
+
+                Y_f_pred = self.net(X_f)
+
+                dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+
+                u = torch.zeros(Y_f_pred.shape[0], 1).to(self.device)  # uncontrolled
+                dY_f = f(Y_f_pred, u)
+
+                loss_f = self._loss_func(dY_pred, dY_f)
+
+                loss = loss_y + self.lamb * loss_f
+
+                y_losses.append(loss_y.item())
+                f_losses.append(loss_f.item())
+                losses.append(loss.item())
+
+                if loss.requires_grad:
+                    loss.backward()
+
+                return loss
+
+            self._optim.step(closure)
+
+            if self.lr_scheduler is not None:
+                self._scheduler.step()
+
+            y_losses = np.array(y_losses)
+            f_losses = np.array(f_losses)
+            # losses = np.array(losses)
 
         return y_losses[-1], f_losses[-1]
