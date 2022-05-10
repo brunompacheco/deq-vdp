@@ -184,6 +184,22 @@ class Trainer(ABC):
             self._scheduler = Scheduler(self._optim, **self.lr_scheduler_params)
 
         if self._log_to_wandb:
+            if not hasattr(self, '_wandb_config'):
+                self._wandb_config = dict()
+
+            for k, v in {
+                "learning_rate": self.lr,
+                "epochs": self.epochs,
+                "model": type(self.net).__name__,
+                "optimizer": self.optimizer,
+                "lr_scheduler": self.lr_scheduler,
+                "lr_scheduler_params": self.lr_scheduler_params,
+                "loss_func": self.loss_func,
+                "random_seed": self.random_seed,
+                "device": self.device,
+            }.items():
+                self._wandb_config[k] = v
+
             self.l.info('Initializing wandb.')
             self.initialize_wandb()
 
@@ -199,17 +215,7 @@ class Trainer(ABC):
             project=self.wandb_project,
             entity="brunompac",
             group=self.wandb_group,
-            config={
-                "learning_rate": self.lr,
-                "epochs": self.epochs,
-                "model": type(self.net).__name__,
-                "optimizer": self.optimizer,
-                "lr_scheduler": self.lr_scheduler,
-                "lr_scheduler_params": self.lr_scheduler_params,
-                "loss_func": self.loss_func,
-                "random_seed": self.random_seed,
-                "device": self.device,
-            },
+            config=self._wandb_config,
         )
 
         wandb.watch(self.net)
@@ -634,29 +640,57 @@ class VdPTrainerLBFGS(VdPTrainer):
 
 class VdPTrainerPINN(Trainer):
     def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=1e5, y_bounds=(-3, 3),
-                 T_max=20., val_dt=0.1, epochs=5, lr=0.1, optimizer: str = 'Adam',
-                 lamb=.1, optimizer_params: dict = None, loss_func: str = 'MSELoss',
+                 T_max=20., T_init=None, init_slack=2e3, end_slack=2e3, val_dt=0.1, epochs=5, lr=0.1, optimizer: str = 'Adam',
+                 lamb=0.1, optimizer_params: dict = None, loss_func: str = 'MSELoss',
                  lr_scheduler: str = None, lr_scheduler_params: dict = None,
-                 device=None, wandb_project="van-der-pol", wandb_group="PINN-Adam",
+                 device=None, wandb_project="van-der-pol", wandb_group="PINN-Adam-ODE-like",
                  logger=None, checkpoint_every=50, random_seed=42):
+        self.Nf = int(Nf)    # number of collocation points
+        self.y_0 = y_0  # initial conditions
+        self.y_bounds = y_bounds
+        self.val_dt = val_dt
+
+        self.T_max = T_max
+        if T_init is None:
+            self.T_init = 0.1 * self.T_max
+        elif T_init < 0:
+            self.T_init = self.T_max
+        else:
+            self.T_init = T_init
+        
+        if 0 < init_slack < 1:
+            init_slack = init_slack * epochs
+
+        if 0 < end_slack < 1:
+            end_slack = end_slack * epochs
+
+        self.init_slack = int(init_slack)
+        self.end_slack = int(end_slack)
+
+        if lamb is None:
+            self.lamb = 1 / self.Nf
+        else:
+            self.lamb = lamb
+
+        self.data = None
+        self.val_data = None
+
+        self._wandb_config = {
+            'T_max': self.T_max,
+            'T_init': self.T_init,
+            'y0': self.y_0,
+        }
+
         super().__init__(net, epochs, lr, optimizer, optimizer_params, loss_func,
                          lr_scheduler, lr_scheduler_params, device,
                          wandb_project, wandb_group, logger, checkpoint_every,
                          random_seed)
 
-        self.Nf = int(Nf)    # number of collocation points
-        self.y_0 = y_0  # initial conditions
-        self.y_bounds = y_bounds
-        self.T_max = T_max
-        self.val_dt = val_dt
+    def prepare_data(self, T=None):
+        if T is None:
+            T = self.T_max
 
-        self.lamb = lamb
-
-        self.data = None
-        self.val_data = None
-
-    def prepare_data(self):
-        X = torch.rand(self.Nf,1) * self.T_max
+        X = torch.rand(self.Nf,1) * T
 
         self.data = X.to(self.device)
 
@@ -688,6 +722,16 @@ class VdPTrainerPINN(Trainer):
         return torch.stack((delY0_pred, delY1_pred), dim=-1)
 
     def _run_epoch(self):
+        if self._e < self.init_slack:
+            self.curr_T = self.T_init
+        elif self._e > self.end_slack:
+            self.curr_T = self.T_max
+        else:
+            self.curr_T = self.T_init + (self.T_max - self.T_init) * (self._e - self.init_slack) / (self.epochs - self.end_slack - self.init_slack)
+        self.l.info(f"Current T = {self.curr_T:.2f}")
+
+        self.prepare_data(T=self.curr_T)
+
         # train
         train_time, (train_loss_y, train_loss_f) = timeit(self.train_pass)()
         train_loss = train_loss_y + self.lamb * train_loss_f
@@ -696,16 +740,19 @@ class VdPTrainerPINN(Trainer):
         self.l.info(f"Training loss = {train_loss}")
 
         # validation
-        val_time, iae = timeit(self.validation_pass)()
+        val_time, (iae, partial_iae) = timeit(self.validation_pass)()
 
         self.l.info(f"Validation pass took {val_time:.3f} seconds")
         self.l.info(f"IAE = {iae}")
+        self.l.info(f"Partial IAE = {partial_iae}")
 
         data_to_log = {
             "train_loss": train_loss,
             "train_loss_y": train_loss_y,
             "train_loss_f": train_loss_f,
             "iae": iae,
+            "partial_iae": partial_iae,
+            "T": self.curr_T,
         }
 
         val_score = iae  # defines best model
@@ -721,24 +768,43 @@ class VdPTrainerPINN(Trainer):
 
         # collocation
         X_f = self.data
-        X_f.requires_grad_()
 
+        X_t.requires_grad_()
+        X_f.requires_grad_()
         with torch.set_grad_enabled(True):
             self._optim.zero_grad()
 
             with autocast():
-                Y_t_pred = self.net(X_t)
+                y_t_pred = self.net(X_t)
+
+                dy_t_pred = torch.autograd.grad(
+                    y_t_pred.sum(),
+                    X_t,
+                    create_graph=True,
+                )[0]
+
+                Y_t_pred = torch.stack([y_t_pred, dy_t_pred], dim=-1).squeeze(1)
 
                 loss_y = self._loss_func(Y_t_pred, Y_t)
 
-                Y_f_pred = self.net(X_f)
+                y_pred = self.net(X_f)
 
-                dY_pred = self.get_dY_pred(Y_f_pred, X_f)
+                dy_pred = torch.autograd.grad(
+                    y_pred.sum(),
+                    X_f,
+                    create_graph=True,
+                )[0]
 
-                u = torch.zeros(Y_f_pred.shape[0], 1).to(self.device)  # uncontrolled
-                dY_f = f(Y_f_pred, u)
+                ddy_pred = torch.autograd.grad(
+                    dy_pred.sum(),
+                    X_f,
+                    create_graph=True,
+                )[0]
 
-                loss_f = self._loss_func(dY_pred, dY_f)
+                mu = 1.
+                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred
+                ode = ddy_pred - ddy
+                loss_f = self._loss_func(ode, torch.zeros_like(ode))
 
                 loss = loss_y + self.lamb * loss_f
 
@@ -757,12 +823,49 @@ class VdPTrainerPINN(Trainer):
 
         X, Y = self.val_data
 
-        with torch.set_grad_enabled(False):
-            Y_pred = self.net(X)
+        X.requires_grad_()
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+            y_pred = self.net(X)
+
+        dy_pred = torch.autograd.grad(
+            y_pred.sum(),
+            X,
+            create_graph=False,
+        )[0]
+
+        Y_pred = torch.stack([y_pred, dy_pred], dim=-1).squeeze(1)
 
         iae = (Y - Y_pred).abs().mean().item()
 
-        return iae
+        partial_ix = (X <= self.curr_T).squeeze()
+        X_part = X[partial_ix]
+        Y_part = Y[partial_ix]
+
+        X_part.requires_grad_()
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+            y_part_pred = self.net(X_part)
+
+        dy_part_pred = torch.autograd.grad(
+            y_part_pred.sum(),
+            X_part,
+            create_graph=False,
+        )[0]
+
+        Y_part_pred = torch.stack([y_part_pred, dy_part_pred], dim=-1).squeeze(1)
+
+        partial_iae = (Y_part - Y_part_pred).abs().mean().item()
+
+        if self._e % 500 == 0 and self._log_to_wandb:
+            data = [[x,y1,y2] for x,y1,y2 in zip(
+                X.squeeze().cpu().detach().numpy(),
+                Y_pred[:,0].squeeze().cpu().detach().numpy(),
+                Y_pred[:,1].squeeze().cpu().detach().numpy(),
+            )]
+            wandb.log({'dynamics': wandb.Table(data=data, columns=['t', 'y1', 'y2'])})
+
+        return iae, partial_iae
 
 class VdPTrainerPINNLBFGS(VdPTrainerPINN):
     def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=100000, y_bounds=(-3, 3),
