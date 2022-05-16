@@ -31,12 +31,19 @@ def anderson(f: nn.Module, x0: torch.Tensor, m=3, lam=1e-4, max_iter=50,
     for k in range(2, max_iter):
         n = min(k, m)
         G = F[:,:n]-X[:,:n]
-        H[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + lam*torch.eye(n, dtype=x0.dtype,device=x0.device)[None]
-        alpha = torch.solve(y[:,:n+1], H[:,:n+1,:n+1])[0][:, 1:n+1, 0]   # (bsz x n)
+        H_ = H.clone()
+        H_[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + lam*torch.eye(n, dtype=x0.dtype,device=x0.device)[None]
+        H = H_
+        alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]   # (bsz x n)
         
-        X[:,k%m] = beta * (alpha[:,None] @ F[:,:n])[:,0] + (1-beta)*(alpha[:,None] @ X[:,:n])[:,0]
-        F[:,k%m] = f(X[:,k%m].view_as(x0)).view(bsz, -1)
-        res.append((F[:,k%m] - X[:,k%m]).norm().item()/(1e-5 + F[:,k%m].norm().item()))
+        X_new = X.clone()
+        F_new = F.clone()
+        X_new[:,k%m] = beta * (alpha[:,None] @ F[:,:n])[:,0] + (1-beta)*(alpha[:,None] @ X[:,:n])[:,0]
+        F_new[:,k%m] = f(X_new[:,k%m].view_as(x0)).view(bsz, -1)
+        res.append((F_new[:,k%m] - X_new[:,k%m]).norm().item()/(1e-5 + F_new[:,k%m].norm().item()))
+
+        X, F = X_new, F_new
+
         if (res[-1] < tol):
             break
     return X[:,k%m].view_as(x0), res
