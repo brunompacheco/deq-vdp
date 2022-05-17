@@ -24,11 +24,13 @@ class ShallowFCN(nn.Module):
         return self.nonlin(y)
 
 class DEQModel(nn.Module):
-    def __init__(self, f: nn.Module, solver, **kwargs):
+    def __init__(self, f: nn.Module, solver, always_compute_grad=False, **kwargs):
         super().__init__()
         self.f = f
         self.solver = solver
         self.kwargs = kwargs
+
+        self.always_compute_grad = always_compute_grad
 
     def forward(self, x: torch.Tensor):
         z0 = torch.zeros(x.shape[0], self.f.n_states).to(x.device)
@@ -42,14 +44,15 @@ class DEQModel(nn.Module):
             )
 
         # (Prepare for) Backward pass, see step 3 above
-        if self.training:
+        if self.training or self.always_compute_grad:
             z_star.requires_grad_()
-            # re-engage autograd (I believe this is necessary to compute df/dx, which is necessary for backprop)
+            # re-engage autograd. this is necessary to add the df/d(*) hook
             new_z_star = self.f(z_star, x)
             
             # Jacobian-related computations, see additional step above. For instance:
             # jac_loss = jac_loss_estimate(new_z_star, z_star, vecs=1)
 
+            # new_z_start already has the df/d(*) hook, but the J_g^-1 must be added mannually
             def backward_hook(grad):
                 if self.hook is not None:
                     self.hook.remove()
