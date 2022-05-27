@@ -7,6 +7,8 @@ import random
 from time import time
 import numpy as np
 
+from scipy import interpolate
+
 import torch
 import torch.nn as nn
 
@@ -15,6 +17,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torchdiffeq import odeint
 
 import wandb
+from deq_vdp.core import DEQModel
 
 from deq_vdp.vdp import get_data, f
 
@@ -1081,11 +1084,11 @@ class VdPTrainerSIPINN(VdPTrainerPINN):
 
 class VdPTrainerPINC(VdPTrainerSIPINN):
     def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=100000, Nt=1000, y_bounds=(-3, 3),
-                 T_max=20, T_init=-1, init_slack=0, end_slack=0, val_dt=0.1, epochs=5,
-                 lr=0.1, optimizer: str = 'Adam', lamb=0.1, dt=1.,
+                 u_bounds=(-1,1), T_max=20, T_init=-1, init_slack=0, end_slack=0, val_dt=0.1,
+                 epochs=5, lr=0.1, optimizer: str = 'Adam', lamb=0.1, dt=1.,
                  optimizer_params: dict = None, loss_func: str = 'MSELoss',
                  lr_scheduler: str = None, lr_scheduler_params: dict = None,
-                 device=None, wandb_project="van-der-pol", wandb_group="Uncontrolled-PINC",
+                 device=None, wandb_project="van-der-pol", wandb_group="PINC",
                  logger=None, checkpoint_every=50, random_seed=42):
         super().__init__(net, y_0, Nf, y_bounds, T_max, T_init, init_slack, end_slack,
                          val_dt, epochs, lr, optimizer, lamb, optimizer_params,
@@ -1094,35 +1097,48 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
                          random_seed)
         self.dt = dt
         self.Nt = int(Nt)
+        self.u_bounds = u_bounds
 
     def prepare_data(self, T=None):
         if T is None:
             T = self.T_max
 
         y_range = self.y_bounds[1] - self.y_bounds[0]
+        u_range = self.u_bounds[1] - self.u_bounds[0]
 
         t_b = torch.zeros(self.Nt,1).to(self.device)
         Y_b = torch.rand(self.Nt,2).to(self.device) * y_range + self.y_bounds[0]  # State data points for training
+        u_b = torch.rand(self.Nt,1).to(self.device) * u_range + self.u_bounds[0]  # input data points for training
 
         t_f = torch.rand(self.Nf,1).to(self.device) * self.dt
         Y_f = torch.rand(self.Nf,2).to(self.device) * y_range + self.y_bounds[0]  # State data points for training
+        u_f = torch.rand(self.Nf,1).to(self.device) * u_range + self.u_bounds[0]  # input data points for training
 
-        self.data = (t_b, Y_b), (t_f, Y_f)
+        self.data = (t_b, Y_b, u_b), (t_f, Y_f, u_f)
 
         if self.val_data is None:
             K = int(self.T_max / self.val_dt)
 
             t_val = torch.Tensor([i * self.val_dt for i in range(K+1)])
 
-            u = torch.zeros(1, 1)  # uncontrolled
-            Y_val = odeint(lambda t, y: f(y,u), torch.Tensor(self.y_0).unsqueeze(0), t_val, method='rk4')
+            u_ = torch.Tensor([0,-.5,0.,1.,0.])
+            u = interpolate.interp1d(t_val.numpy()[::int(K/4)],u_.numpy(), kind='zero')
+            def u_val(t):
+                u__ = u(t)
+                u__ = torch.Tensor(u__).unsqueeze(-1)
+                return u__
 
-            self.val_data = t_val.to(self.device).unsqueeze(-1), Y_val.to(self.device).squeeze()
+            Y_val = odeint(lambda t, y: f(y,u_val(t)), torch.Tensor(self.y_0).unsqueeze(0), t_val, method='rk4')
+            Y_val = Y_val.to(self.device).squeeze()
+
+            t_val = t_val.to(self.device).unsqueeze(-1)
+
+            self.val_data = t_val, Y_val, u_val
 
     def train_pass(self):
         self.net.train()
 
-        (t_b, Y0_b), (t_f, Y0_f) = self.data
+        (t_b, Y0_b, u_b), (t_f, Y0_f, u_f) = self.data
 
         t_b.requires_grad_()
         t_f.requires_grad_()
@@ -1130,7 +1146,7 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
             self._optim.zero_grad()
 
             with autocast():
-                y_b_pred = self.net(t_b, Y0_b)
+                y_b_pred = self.net(t_b, Y0_b, u_b)
 
                 dy_b_pred = torch.autograd.grad(
                     y_b_pred.sum(),
@@ -1142,7 +1158,7 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
 
                 loss_y = self._loss_func(Y_b_pred, Y0_b)  # as t=0, output must be equal to input
 
-                y_pred = self.net(t_f, Y0_f)
+                y_pred = self.net(t_f, Y0_f, u_f)
 
                 dy_pred = torch.autograd.grad(
                     y_pred.sum(),
@@ -1157,7 +1173,7 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
                 )[0]
 
                 mu = 1.
-                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred
+                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred + u_f
                 ode = ddy_pred - ddy
                 loss_f = self._loss_func(ode, torch.zeros_like(ode))
 
@@ -1176,28 +1192,13 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
     def validation_pass(self):
         self.net.eval()
 
-        t_val, Y = self.val_data
+        t_val, Y, u_val = self.val_data
 
-        y_prev = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
+        y0 = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
 
-        Y_pred = list()
-        for _ in range(t_val.shape[0]):
-            dt = torch.Tensor([self.val_dt]).unsqueeze(0).to(self.device)
-            dt.requires_grad_()
-            with torch.set_grad_enabled(True):
-                self._optim.zero_grad()
-                y_pred = self.net(dt, y_prev)
+        u = u_val(t_val.cpu().detach().squeeze().numpy())
 
-                dy_pred = torch.autograd.grad(
-                    y_pred.sum(),
-                    dt,
-                    create_graph=False,
-                )[0]
-
-                y_prev = torch.stack([y_pred, dy_pred], dim=-1).squeeze(0)
-                Y_pred.append(y_prev)
-
-        Y_pred = torch.cat(Y_pred)
+        Y_pred = self.net.predict(y0,u,self.T_max,self.val_dt)
 
         iae = (Y - Y_pred).abs().mean().item()
 
@@ -1205,14 +1206,14 @@ class VdPTrainerPINC(VdPTrainerSIPINN):
 
 class VdPTrainerPINCLBFGS(VdPTrainerPINC):
     def __init__(self, net: nn.Module, y_0: np.ndarray, Nf=100000, Nt=1000,
-                 y_bounds=(-3, 3), T_max=20, T_init=-1, init_slack=0,
-                 end_slack=0, val_dt=0.1, epochs=5, lr=0.1, lamb=0.1, dt=1.,
+                 y_bounds=(-3, 3), u_bounds=(-1, 1), T_max=20, T_init=-1, init_slack=0,
+                 end_slack=0, val_dt=0.1, epochs=5, lr=0.1, lamb=0.1, dt=1,
                  lbfgs_params: dict = None, loss_func: str = 'MSELoss',
                  lr_scheduler: str = None, lr_scheduler_params: dict = None,
                  device=None, wandb_project="van-der-pol",
-                 wandb_group="Uncontrolled-PINC-LBFGS", logger=None,
-                 checkpoint_every=50, random_seed=42):
-        super().__init__(net, y_0, Nf, Nt, y_bounds, T_max, T_init, init_slack,
+                 wandb_group="PINC-LBFGS", logger=None, checkpoint_every=50,
+                 random_seed=42):
+        super().__init__(net, y_0, Nf, Nt, y_bounds, u_bounds, T_max, T_init, init_slack,
                          end_slack, val_dt, epochs, lr, 'LBFGS', lamb, dt,
                          lbfgs_params, loss_func, lr_scheduler,
                          lr_scheduler_params, device, wandb_project, wandb_group,
@@ -1221,7 +1222,7 @@ class VdPTrainerPINCLBFGS(VdPTrainerPINC):
     def train_pass(self):
         self.net.train()
 
-        (t_b, Y0_b), (t_f, Y0_f) = self.data
+        (t_b, Y0_b, u_b), (t_f, Y0_f, u_f) = self.data
 
         t_b.requires_grad_()
         t_f.requires_grad_()
@@ -1233,7 +1234,7 @@ class VdPTrainerPINCLBFGS(VdPTrainerPINC):
             def closure():
                 self._optim.zero_grad()
 
-                y_b_pred = self.net(t_b, Y0_b)
+                y_b_pred = self.net(t_b, Y0_b, u_b)
 
                 dy_b_pred = torch.autograd.grad(
                     y_b_pred.sum(),
@@ -1245,7 +1246,7 @@ class VdPTrainerPINCLBFGS(VdPTrainerPINC):
 
                 loss_y = self._loss_func(Y_b_pred, Y0_b)  # as t=0, output must be equal to input
 
-                y_pred = self.net(t_f, Y0_f)
+                y_pred = self.net(t_f, Y0_f, u_f)
 
                 dy_pred = torch.autograd.grad(
                     y_pred.sum(),
@@ -1260,7 +1261,7 @@ class VdPTrainerPINCLBFGS(VdPTrainerPINC):
                 )[0]
 
                 mu = 1.
-                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred
+                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred + u_f
                 ode = ddy_pred - ddy
                 loss_f = self._loss_func(ode, torch.zeros_like(ode))
 
@@ -1283,5 +1284,277 @@ class VdPTrainerPINCLBFGS(VdPTrainerPINC):
             y_losses = np.array(y_losses)
             f_losses = np.array(f_losses)
             # losses = np.array(losses)
+
+        return y_losses[-1], f_losses[-1]
+
+class VdPTrainerPIDEQ(Trainer):
+    def __init__(self, net: DEQModel, y_0: np.ndarray, Nf=1e5, y_bounds=(-3, 3),
+                 T_max=2., val_dt=0.1, epochs=5, lr=0.1, optimizer: str = 'Adam',
+                 lamb=0.1, optimizer_params: dict = None, loss_func: str = 'MSELoss',
+                 lr_scheduler: str = None, lr_scheduler_params: dict = None,
+                 device=None, wandb_project="van-der-pol", wandb_group="PIDEQ",
+                 logger=None, checkpoint_every=50, random_seed=42, jac_loss_lamb=0.):
+        self.Nf = int(Nf)    # number of collocation points
+        self.y_0 = y_0  # initial conditions
+        self.y_bounds = y_bounds
+        self.val_dt = val_dt
+
+        self.T_max = T_max
+
+        if lamb is None:
+            self.lamb = 1 / self.Nf
+        else:
+            self.lamb = lamb
+
+        self.data = None
+        self.val_data = None
+
+        self.jac_loss_lamb = jac_loss_lamb
+
+        self._wandb_config = {
+            'T_max': self.T_max,
+            'y0': self.y_0,
+        }
+
+        super().__init__(net, epochs, lr, optimizer, optimizer_params, loss_func,
+                         lr_scheduler, lr_scheduler_params, device,
+                         wandb_project, wandb_group, logger, checkpoint_every,
+                         random_seed)
+
+    def prepare_data(self):
+        X = torch.rand(self.Nf,1) * self.T_max
+
+        self.data = X.to(self.device)
+
+        if self.val_data is None:
+            K = int(self.T_max / self.val_dt)
+
+            X_val = torch.Tensor([i * self.val_dt for i in range(K+1)])
+
+            u = torch.zeros(1, 1)  # uncontrolled
+            Y_val = odeint(lambda t, y: f(y,u), torch.Tensor(self.y_0).unsqueeze(0), X_val, method='rk4')
+
+            self.val_data = X_val.to(self.device).unsqueeze(-1), Y_val.to(self.device).squeeze()
+
+    def _run_epoch(self):
+        self.prepare_data()
+
+        # train
+        train_time, train_losses = timeit(self.train_pass)()
+        train_loss_y = train_losses[0]
+        train_loss_f = train_losses[1]
+
+        train_loss = train_loss_y + self.lamb * train_loss_f
+
+        if self.jac_loss_lamb > 0:
+            train_loss_jac = train_losses[2]
+            train_loss = train_loss + self.jac_loss_lamb * train_loss_jac
+
+        self.l.info(f"Training pass took {train_time:.3f} seconds")
+        self.l.info(f"Training loss = {train_loss}")
+
+        # validation
+        val_time, iae = timeit(self.validation_pass)()
+
+        self.l.info(f"Validation pass took {val_time:.3f} seconds")
+        self.l.info(f"IAE = {iae}")
+
+        data_to_log = {
+            "train_loss": train_loss,
+            "train_loss_y": train_loss_y,
+            "train_loss_f": train_loss_f,
+            "val_time": val_time,
+            "train_time": train_time,
+            "iae": iae,
+        }
+
+        if self.jac_loss_lamb > 0:
+            data_to_log["train_loss_jac"] = train_loss_jac
+
+        val_score = iae  # defines best model
+
+        return data_to_log, val_score
+
+    def train_pass(self):
+        self.net.train()
+
+        # boundary
+        X_t = torch.zeros(1,1).to(self.device)
+        Y_t = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
+
+        # collocation
+        X_f = self.data
+
+        X_t.requires_grad_()
+        X_f.requires_grad_()
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+
+            if self.jac_loss_lamb > 0:
+                y_t_pred, jac_loss_y = self.net(X_t)
+            else:
+                y_t_pred = self.net(X_t)
+
+            dy_t_pred = torch.autograd.grad(
+                y_t_pred.sum(),
+                X_t,
+                create_graph=True,
+            )[0]
+
+            Y_t_pred = torch.stack([y_t_pred, dy_t_pred], dim=-1).squeeze(1)
+
+            loss_y = self._loss_func(Y_t_pred, Y_t)
+
+            if self.jac_loss_lamb > 0:
+                y_pred, jac_loss_f = self.net(X_f)
+            else:
+                y_pred = self.net(X_f)
+
+            dy_pred = torch.autograd.grad(
+                y_pred.sum(),
+                X_f,
+                create_graph=True,
+            )[0]
+
+            ddy_pred = torch.autograd.grad(
+                dy_pred.sum(),
+                X_f,
+                create_graph=True,
+            )[0]
+
+            mu = 1.
+            ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred
+            ode = ddy_pred - ddy
+            loss_f = self._loss_func(ode, torch.zeros_like(ode))
+
+            loss = loss_y + self.lamb * loss_f
+
+            if self.jac_loss_lamb > 0:
+                loss += self.jac_loss_lamb * (jac_loss_y + jac_loss_f)
+
+            loss.backward()
+
+            self._optim.step()
+
+            if self.lr_scheduler is not None:
+                self._scheduler.step()
+
+        if self.jac_loss_lamb > 0:
+            return loss_y.item(), loss_f.item(), (jac_loss_y + jac_loss_f).item()
+        else:
+            return loss_y.item(), loss_f.item()
+
+    def validation_pass(self):
+        self.net.eval()
+
+        X, Y = self.val_data
+
+        X.requires_grad_()
+        with torch.set_grad_enabled(True):
+            self._optim.zero_grad()
+            y_pred = self.net(X)
+
+        dy_pred = torch.autograd.grad(
+            y_pred.sum(),
+            X,
+            create_graph=False,
+        )[0]
+
+        Y_pred = torch.stack([y_pred, dy_pred], dim=-1).squeeze(1)
+
+        iae = (Y - Y_pred).abs().mean().detach().item()
+
+        if self._e % 500 == 0 and self._log_to_wandb:
+            data = [[x,y1,y2] for x,y1,y2 in zip(
+                X.squeeze().cpu().detach().numpy(),
+                Y_pred[:,0].squeeze().cpu().detach().numpy(),
+                Y_pred[:,1].squeeze().cpu().detach().numpy(),
+            )]
+            wandb.log({'dynamics': wandb.Table(data=data, columns=['t', 'y1', 'y2'])})
+
+        return iae
+
+class VdPTrainerPINDEQLBFGS(VdPTrainerPIDEQ):
+    def __init__(self, net: DEQModel, y_0: np.ndarray, Nf=100000, y_bounds=(-3, 3),
+                 T_max=2, val_dt=0.1, epochs=5, lr=0.1, lamb=0.1,
+                 optimizer_params: dict = None, loss_func: str = 'MSELoss',
+                 lr_scheduler: str = None, lr_scheduler_params: dict = None,
+                 device=None, wandb_project="van-der-pol", wandb_group="PIDEQ-LBFGS",
+                 logger=None, checkpoint_every=50, random_seed=42):
+        super().__init__(net, y_0, Nf, y_bounds, T_max, val_dt, epochs, lr, "LBFGS",
+                         lamb, optimizer_params, loss_func, lr_scheduler,
+                         lr_scheduler_params, device, wandb_project, wandb_group,
+                         logger, checkpoint_every, random_seed)
+
+    def train_pass(self):
+        self.net.train()
+
+        # boundary
+        X_t = torch.zeros(1,1).to(self.device)
+        Y_t = torch.Tensor(self.y_0).unsqueeze(0).to(self.device)
+
+        # collocation
+        X_f = self.data
+
+        X_t.requires_grad_()
+        X_f.requires_grad_()
+
+        y_losses = list()
+        f_losses = list()
+        losses = list()
+        with torch.set_grad_enabled(True):
+            def closure():
+                self._optim.zero_grad()
+
+                y_t_pred = self.net(X_t)
+
+                dy_t_pred = torch.autograd.grad(
+                    y_t_pred.sum(),
+                    X_t,
+                    create_graph=True,
+                )[0]
+
+                Y_t_pred = torch.stack([y_t_pred, dy_t_pred], dim=-1).squeeze(1)
+
+                loss_y = self._loss_func(Y_t_pred, Y_t)
+
+                y_pred = self.net(X_f)
+
+                dy_pred = torch.autograd.grad(
+                    y_pred.sum(),
+                    X_f,
+                    create_graph=True,
+                )[0]
+
+                ddy_pred = torch.autograd.grad(
+                    dy_pred.sum(),
+                    X_f,
+                    create_graph=True,
+                )[0]
+
+                mu = 1.
+                ddy = + mu * (1 - y_pred ** 2) * dy_pred - y_pred
+                ode = ddy_pred - ddy
+                loss_f = self._loss_func(ode, torch.zeros_like(ode))
+
+                loss = loss_y + self.lamb * loss_f
+
+                y_losses.append(loss_y.item())
+                f_losses.append(loss_f.item())
+                losses.append(loss.item())
+
+                if loss.requires_grad:
+                    loss.backward()
+
+                return loss
+
+            self._optim.step(closure)
+
+            y_losses = np.array(y_losses)
+            f_losses = np.array(f_losses)
+            losses = np.array(losses)
+
+            if self.lr_scheduler is not None:
+                self._scheduler.step()
 
         return y_losses[-1], f_losses[-1]
